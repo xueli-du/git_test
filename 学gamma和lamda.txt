@@ -1,0 +1,662 @@
+import time
+import math
+import numpy as np
+from numpy.linalg import norm
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# =========================================================
+# 1. 绘图
+# =========================================================
+def plot_imagesc(theta, r, img, title_str, vmin=None, vmax=None, cmap="jet"):
+    plt.figure(figsize=(7.5, 5.0))
+    plt.imshow(
+        img,
+        aspect="auto",
+        extent=[theta[0], theta[-1], r[-1], r[0]],
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    plt.title(title_str)
+    plt.xlabel("theta (deg)")
+    plt.ylabel("r (m)")
+    plt.colorbar()
+    plt.tight_layout()
+
+
+# =========================================================
+# 2. 数值稳定 Cholesky
+# =========================================================
+def safe_cholesky(C, jitter=1e-8, max_tries=8):
+    I = torch.eye(C.shape[0], dtype=C.dtype, device=C.device)
+    cur = jitter
+    for _ in range(max_tries):
+        try:
+            return torch.linalg.cholesky(C + cur * I)
+        except RuntimeError:
+            cur *= 10.0
+    return torch.linalg.cholesky(C + cur * I)
+
+class SBLNetPowerUpdater(nn.Module):
+    def __init__(self, n_grid, in_dim=10, n_heads=8, dropout=0.0, gamma_max=1e6, eps=1e-12):
+        super().__init__()
+        self.n_grid = n_grid
+        self.gamma_max = gamma_max
+        self.eps = eps
+
+        # 更强的卷积
+        self.conv1 = nn.Conv1d(in_dim, 64, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.conv2 = nn.Conv1d(64, 32, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.conv3 = nn.Conv1d(32, 16, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(16)
+
+        # 更强 Transformer
+        self.stl = nn.TransformerEncoderLayer(
+            d_model=16, nhead=8, dim_feedforward=64,
+            dropout=0.0, batch_first=True, activation='gelu'
+        )
+
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(n_grid * 16, n_grid)
+
+    def forward(self, feat):
+        x = feat.t().unsqueeze(0)
+        x = F.gelu(self.bn1(self.conv1(x)))
+        x = F.gelu(self.bn2(self.conv2(x)))
+        x = F.gelu(self.bn3(self.conv3(x)))
+
+        x = x.permute(0, 2, 1)
+        x = self.stl(x)
+
+        x = self.flatten(x)
+        x = self.fc(x).squeeze(0)
+
+        # 🔥 关键：让网络输出更大幅度！不要被 softplus 限制太小
+        gamma_new = F.softplus(x * 2.0) + self.eps
+        gamma_new = torch.clamp(gamma_new, min=self.eps, max=self.gamma_max)
+        return gamma_new
+
+
+class LambdaNetUpdater(nn.Module):
+    def __init__(self, in_dim=6, hidden_dim=32, max_log_step=0.25, eps=1e-12):
+        super().__init__()
+        self.max_log_step = max_log_step
+        self.eps = eps
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, feat, lambda_em):
+        # 只学习对 EM 的小幅乘性修正，避免把弱目标都吸收到噪声里
+        delta = torch.tanh(self.net(feat).squeeze(-1)) * self.max_log_step
+        lambda_new = lambda_em * torch.exp(delta)
+        lambda_new = torch.clamp(lambda_new, min=self.eps)
+        return lambda_new, delta
+
+class UnsupervisedMSBLLayer(nn.Module):
+    def __init__(self, n_grid, hidden_unused=64, eps=1e-12):
+        super().__init__()
+        self.updater = SBLNetPowerUpdater(
+            n_grid=n_grid, in_dim=10, n_heads=8, dropout=0.0, eps=eps
+        )
+        self.lambda_updater = LambdaNetUpdater(
+            in_dim=6, hidden_dim=32, max_log_step=0.25, eps=eps
+        )
+        self.eps = eps
+
+    @staticmethod
+    def posterior(A, Y, gamma, lambda_, eps=1e-12):
+        Nobs, Ngrid = A.shape
+        I = torch.eye(Nobs, dtype=A.dtype, device=A.device)
+        AG = A * gamma.unsqueeze(0)
+        Cy = AG @ A.conj().transpose(0, 1) + lambda_ * I
+        chol = safe_cholesky(Cy)
+
+        Cy_inv_Y = torch.cholesky_solve(Y, chol)
+        Cy_inv_A = torch.cholesky_solve(A, chol)
+
+        mu = gamma.unsqueeze(1) * (A.conj().transpose(0, 1) @ Cy_inv_Y)
+        B = A.conj().transpose(0, 1) @ Cy_inv_A
+        Sigma = torch.diag(gamma) - (gamma[:, None] * B) * gamma[None, :]
+        Sigma = 0.5 * (Sigma + Sigma.conj().transpose(0, 1))
+        diagSigma = torch.clamp(torch.diagonal(Sigma).real, min=eps)
+        return mu, Sigma, diagSigma, Cy, chol
+
+    @staticmethod
+    def lambda_em_update(A, Y, mu, Sigma, eps=1e-12):
+        Nobs, _ = A.shape
+        L = Y.shape[1]
+        R = Y - A @ mu
+        data_term = torch.sum(torch.abs(R) ** 2).real
+        model_term = (L * torch.trace(A @ Sigma @ A.conj().transpose(0, 1))).real
+        lambda_new = (data_term + model_term) / (Nobs * L)
+        lambda_new = torch.clamp(lambda_new, min=eps)
+        return lambda_new
+
+    def forward(self, A, Y, gamma_prev, lambda_prev):
+        eps = self.eps
+        gamma_prev = torch.clamp(gamma_prev, min=eps)
+        lambda_prev = torch.clamp(lambda_prev, min=eps)
+
+        mu, Sigma, diagSigma, _, _ = self.posterior(A, Y, gamma_prev, lambda_prev, eps=eps)
+        mu_power = torch.abs(mu) ** 2
+        row_power_mu = torch.clamp(torch.mean(mu_power, dim=1).real, min=eps)
+        post_energy = torch.clamp(row_power_mu + diagSigma, min=eps)
+
+        # 两个“非平均”特征：
+        # 1) peak_power_mu：该角度在距离维上的最大局部峰值，真目标通常更尖锐
+        # 2) peak_to_mean_mu：峰均比，整列泄漏竖线通常峰均比较低
+        peak_power_mu = torch.clamp(torch.amax(mu_power, dim=1).real, min=eps)
+        peak_to_mean_mu = torch.clamp(peak_power_mu / (row_power_mu + eps), min=eps)
+
+        # 10 维特征：在原有行统计基础上补充两个距离维局部峰值特征
+        feat = torch.stack([
+            torch.log(gamma_prev + eps),
+            torch.log(diagSigma + eps),
+            torch.log(row_power_mu + eps),
+            torch.log(post_energy + eps),
+            torch.log(gamma_prev / (diagSigma + eps) + eps),
+            torch.log(row_power_mu / (post_energy + eps) + eps),
+            torch.log(row_power_mu / (gamma_prev + eps) + eps),
+            torch.log(torch.abs(row_power_mu - diagSigma) + eps),
+            torch.log(peak_power_mu + eps),
+            torch.log(peak_to_mean_mu + eps),
+        ], dim=-1)
+
+        # 🔥 核心：网络直接输出 gamma_next，不再小幅度修补
+        gamma_next = self.updater(feat)
+
+        lambda_em = self.lambda_em_update(A, Y, mu, Sigma, eps=eps)
+
+        # 用全局统计量学习 lambda 的修正，而不是逐栅格直接回归
+        res = Y - A @ mu
+        res_energy = torch.mean(torch.abs(res) ** 2).real
+        model_var = torch.trace(A @ Sigma @ A.conj().transpose(0, 1)).real / A.shape[0]
+        gamma_mean = torch.mean(gamma_next)
+        gamma_std = torch.std(gamma_next, unbiased=False)
+        post_mean = torch.mean(post_energy)
+        lambda_feat = torch.stack([
+            torch.log(lambda_prev + eps),
+            torch.log(lambda_em + eps),
+            torch.log(res_energy + eps),
+            torch.log(model_var + eps),
+            torch.log(gamma_mean + eps),
+            torch.log(gamma_std + post_mean + eps),
+        ], dim=0).unsqueeze(0)
+        lambda_next, lambda_delta = self.lambda_updater(lambda_feat, lambda_em)
+        lambda_next = torch.clamp(lambda_next.squeeze(0), min=eps)
+
+        state = {
+            "mu": mu, "Sigma": Sigma, "diagSigma": diagSigma,
+            "row_power": row_power_mu, "post_energy": post_energy,
+            "gamma_prev": gamma_prev, "gamma_next": gamma_next,
+            "lambda_prev": lambda_prev, "lambda_em": lambda_em,
+            "lambda_delta": lambda_delta.squeeze(0), "lambda_next": lambda_next,
+        }
+        return mu, gamma_next, lambda_next, state
+# =========================================================
+# 5. 多层网络
+# =========================================================
+class UMSBLNet(nn.Module):
+    def __init__(self, n_grid, num_layers=8, eps=1e-12):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            UnsupervisedMSBLLayer(n_grid=n_grid, eps=eps)
+            for _ in range(num_layers)
+        ])
+        self.num_layers = num_layers
+        self.eps = eps
+
+    def init_gamma(self, A, Y):
+        mf = A.conj().transpose(0, 1) @ Y
+        power = torch.mean(torch.abs(mf) ** 2, dim=1).real
+        gamma0 = torch.pow(power / (torch.max(power) + self.eps), 2.0)  # 更锐
+        gamma0 = torch.clamp(gamma0, min=self.eps)
+        return gamma0
+
+    def init_lambda(self, Y):
+        ypow = torch.mean(torch.abs(Y) ** 2).real
+        lambda0 = torch.clamp(1e-2 * ypow, min=self.eps)
+        return lambda0
+
+    def final_posterior(self, A, Y, gamma, lambda_):
+        mu, Sigma, diagSigma, _, _ = UnsupervisedMSBLLayer.posterior(
+            A, Y, gamma, lambda_, eps=self.eps
+        )
+        row_power = torch.clamp(torch.mean(torch.abs(mu) ** 2, dim=1).real, min=self.eps)
+        post_energy = torch.clamp(row_power + diagSigma, min=self.eps)
+        return mu, Sigma, diagSigma, row_power, post_energy
+
+    def forward(self, A, Y, gamma0=None, lambda0=None, return_all=True):
+        dtype_real = torch.float32 if A.dtype == torch.complex64 else torch.float64
+
+        if gamma0 is None:
+            gamma = self.init_gamma(A, Y).to(dtype_real)
+        else:
+            gamma = torch.clamp(gamma0.to(device=Y.device, dtype=dtype_real), min=self.eps)
+
+        if lambda0 is None:
+            lambda_ = self.init_lambda(Y).to(dtype_real)
+        else:
+            lambda_ = torch.clamp(
+                torch.as_tensor(lambda0, device=Y.device, dtype=dtype_real),
+                min=self.eps
+            )
+
+        states = []
+        X = None
+        for layer in self.layers:
+            X, gamma, lambda_, st = layer(A, Y, gamma, lambda_)
+            states.append(st)
+
+        X, Sigma, diagSigma, row_power, post_energy = self.final_posterior(A, Y, gamma, lambda_)
+
+        out = {
+            "x": X, "gamma": gamma, "Sigma": Sigma, "diagSigma": diagSigma,
+            "row_power": row_power, "post_energy": post_energy, "lambda": lambda_,
+        }
+        if return_all:
+            out["states"] = states
+        return out
+
+    def evidence_loss(self, A, Y, gamma, lambda_):
+        Nobs = A.shape[0]
+        L = Y.shape[1]
+        I = torch.eye(Nobs, dtype=A.dtype, device=A.device)
+        AG = A * gamma.unsqueeze(0)
+        Cy = AG @ A.conj().transpose(0, 1) + lambda_ * I
+        chol = safe_cholesky(Cy)
+        diag_chol = torch.diagonal(chol).real
+        logdet = 2.0 * torch.sum(torch.log(diag_chol + self.eps))
+        Cy_inv_Y = torch.cholesky_solve(Y, chol)
+        quad = torch.sum((Y.conj() * Cy_inv_Y).real) / L
+        return (logdet + quad) / Nobs
+
+    def unsup_loss(self, A, Y, out, lam_sparse=0.01, lam_gamma=1e-4, lam_lambda_reg=1e-3):
+        gamma = out["gamma"]
+        lambda_ = out["lambda"]
+        X = out["x"]
+
+        loss_evi = self.evidence_loss(A, Y, gamma, lambda_)
+
+        # 🔥 超强稀疏：L1 + 极小值抑制，直接提升 RMSE
+        row_norms = torch.norm(X, dim=1)
+        loss_sparse = torch.mean(row_norms) + torch.mean(torch.abs(X))
+
+        # 约束学习到的 lambda 不要偏离 EM 太多
+        loss_lambda_reg = torch.zeros((), dtype=gamma.dtype, device=gamma.device)
+        states = out.get("states", [])
+        if len(states) > 0:
+            reg_terms = []
+            for st in states:
+                lam_em = torch.clamp(st["lambda_em"], min=self.eps)
+                lam_next = torch.clamp(st["lambda_next"], min=self.eps)
+                reg_terms.append(torch.abs(torch.log(lam_next) - torch.log(lam_em)))
+            loss_lambda_reg = torch.mean(torch.stack(reg_terms))
+
+        # 🔥 加权放大稀疏约束！这是拉开 RMSE 的关键
+        loss = (
+            loss_evi
+            + 10.0 * lam_sparse * loss_sparse
+            + lam_gamma * torch.mean(gamma)
+            + lam_lambda_reg * loss_lambda_reg
+        )
+
+        logs = {
+            "loss": float(loss.item()),
+            "evi": float(loss_evi.item()),
+            "sparse_l21": float(loss_sparse.item()),
+            "lambda": float(lambda_.item()),
+            "lambda_reg": float(loss_lambda_reg.item()),
+        }
+        return loss, logs
+# =========================================================
+# 6. 训练
+# =========================================================
+def train_umsbl_unsupervised(
+        Echo,
+        A,
+        num_layers=8,
+        epochs=60,
+        lr=3e-4,
+        device=None,
+        lam_sparse=1e-3,
+        lam_gamma=1e-5,
+        lam_lambda_reg=1e-3,
+):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    Y_t = torch.tensor(Echo, dtype=torch.complex64, device=device)
+    A_t = torch.tensor(A, dtype=torch.complex64, device=device)
+
+    n_grid = A_t.shape[1]
+    model = UMSBLNet(n_grid=n_grid, num_layers=num_layers).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    hist = []
+    best_loss = 1e30
+    best_state = None
+
+    for ep in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+
+        out = model(A_t, Y_t, return_all=True)
+        loss, logs = model.unsup_loss(
+            A_t, Y_t, out,
+            lam_sparse=lam_sparse,
+            lam_gamma=lam_gamma,
+            lam_lambda_reg=lam_lambda_reg,
+        )
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        hist.append(logs["loss"])
+
+        if logs["loss"] < best_loss:
+            best_loss = logs["loss"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if (ep + 1) % 10 == 0 or ep == 0:
+            print(
+                f"[U-MSBL] Epoch {ep + 1:03d}/{epochs} | "
+                f"loss={logs['loss']:.6f} | "
+                f"evi={logs['evi']:.6f} | "
+                f"sparse={logs['sparse_l21']:.6f} | "
+                f"lambda={logs['lambda']:.6f} | "
+                f"lreg={logs['lambda_reg']:.6f}"
+            )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    with torch.no_grad():
+        out = model(A_t, Y_t, return_all=True)
+
+    result = {
+        "x": out["x"].detach().cpu().numpy(),
+        "gamma": out["gamma"].detach().cpu().numpy(),
+        "row_power": out["row_power"].detach().cpu().numpy(),
+        "post_energy": out["post_energy"].detach().cpu().numpy(),
+        "diagSigma": out["diagSigma"].detach().cpu().numpy(),
+        "lambda": float(out["lambda"].detach().cpu().item()),
+        "count": num_layers,
+        "model": model,
+        "out_torch": out,
+    }
+    return result, hist
+
+
+# =========================================================
+# 7. 传统 MSBL baseline
+# =========================================================
+def MSBL(A1, Y1, lambda_=1e-3, max_iters=8, tol=1e-3):
+    scl = np.std(Y1.reshape(-1), ddof=1)
+    scaled = False
+    if (scl < 0.4) or (scl > 1):
+        Y1 = Y1 / (scl + 1e-12) * 0.4
+        scaled = True
+
+    Nobs, Ngrid = A1.shape
+    _, L = Y1.shape
+
+    AuA = A1.conj().T @ A1
+    Auy = A1.conj().T @ Y1
+
+    mu_x = Auy.copy()
+    gamma = np.ones((Ngrid, 1), dtype=np.float64)
+    count = 0
+
+    t1 = time.perf_counter()
+    for _ in range(max_iters):
+        count += 1
+        mu_old = mu_x.copy()
+        gamma = np.maximum(gamma, 1e-9)
+
+        sigma_0 = 1e-9 * np.eye(Ngrid, dtype=A1.dtype) + np.diag((1.0 / gamma[:, 0]).astype(A1.dtype))
+        sigma_x = np.linalg.inv((1.0 / lambda_) * AuA + sigma_0)
+        mu_x = (1.0 / lambda_) * (sigma_x @ Auy)
+
+        diag_mu = np.diag(mu_x @ mu_x.conj().T) / L
+        den = 1.0 - (1.0 / gamma[:, 0]) * np.diag(sigma_x)
+        den = np.maximum(np.real(den), 1e-8)
+        gamma = np.real(diag_mu / den).reshape(-1, 1)
+
+        Rx = Y1 - A1 @ mu_x
+        lambda_old = lambda_
+        lambda_ = (1.0 / (Nobs * L)) * (
+            np.trace(Rx.conj().T @ Rx) + lambda_old * L * (Ngrid - np.trace(sigma_x @ sigma_0))
+        )
+        lambda_ = np.real(lambda_).item()
+
+        dmu = mu_old.reshape(-1, order="F") - mu_x.reshape(-1, order="F")
+        rel_change = np.linalg.norm(dmu) / (np.linalg.norm(mu_x.reshape(-1, order="F")) + 1e-30)
+        if rel_change < tol:
+            break
+
+    x_est = mu_x * scl / 0.4 if scaled else mu_x
+    result = {
+        "x": x_est,
+        "gamma": gamma,
+        "count": count,
+        "lambda": lambda_,
+        "sigma_x": sigma_x,
+    }
+    t_elapsed = time.perf_counter() - t1
+    return result, t_elapsed
+
+
+# =========================================================
+# 8. 接口
+# =========================================================
+def get_spectrum(Echo, A, mode="msbl"):
+    if mode == "cbf":
+        return np.abs(A.conj().T @ Echo)
+
+    if mode == "msbl":
+        res, _ = MSBL(A, Echo, max_iters=10, tol=1e-3)
+        return np.abs(res["x"])
+
+    if mode == "umsbl":
+        res, _ = train_umsbl_unsupervised(Echo, A)
+        return np.abs(res["x"])
+
+    raise ValueError("mode must be cbf / msbl / umsbl")
+
+
+# =========================================================
+# 9. off-grid 仿真
+# =========================================================
+def pulse_gen_offgrid(Ntar, Nth, Nx, snr, theta_min=-30, theta_max=30, max_offset_frac=0.4):
+    c = 1480.0
+    fs = 300e3
+    f0 = 750e3
+    lamda = c / f0
+    d = 0.5 * lamda
+
+    theta_grid = np.linspace(theta_min, theta_max, Nth)
+    dtheta = theta_grid[1] - theta_grid[0]
+
+    pulse_width = 2e-4
+    Nt = 2 ** 12
+    pw_tar = int(pulse_width * fs)
+
+    base_idx = np.random.choice(np.arange(5, Nth - 5), size=Ntar, replace=False)
+    offset = np.random.uniform(-max_offset_frac * dtheta, max_offset_frac * dtheta, size=Ntar)
+    theta_true = theta_grid[base_idx] + offset
+
+    range_tar = np.random.randint(0, Nt - pw_tar, size=(Ntar,))
+    amp_tar = 0.8 + 0.2 * np.random.rand(Ntar)
+
+    Lx = (Nx - 1) * d
+    elmx = np.linspace(-Lx / 2, Lx / 2, Nx)
+
+    elmx_A, theta_A = np.meshgrid(elmx, theta_grid, indexing='ij')
+    A_dict = np.exp(-1j * 2 * np.pi * f0 * elmx_A * np.sin(np.deg2rad(theta_A)) / c)
+
+    X_grid = np.zeros((Nth, Nt), dtype=np.float64)
+    for k in range(Ntar):
+        idx = base_idx[k]
+        rng = range_tar[k]
+        X_grid[idx, rng:rng + pw_tar] = amp_tar[k]
+    X_grid = X_grid[:, ::4]
+    Nt_down = Nt // 4
+
+    Echo = np.zeros((Nx, Nt), dtype=np.complex128)
+    for k in range(Ntar):
+        a_true = np.exp(-1j * 2 * np.pi * f0 * elmx * np.sin(np.deg2rad(theta_true[k])) / c)
+        s_k = np.zeros((Nt,), dtype=np.float64)
+        s_k[range_tar[k]:range_tar[k] + pw_tar] = amp_tar[k]
+        Echo += a_true[:, None] @ s_k[None, :]
+
+    Echo = Echo[:, ::4]
+
+    Ps = np.mean(np.abs(Echo) ** 2)
+    Pn = Ps / (10 ** (snr / 10))
+    noise = np.sqrt(Pn / 2) * (np.random.randn(*Echo.shape) + 1j * np.random.randn(*Echo.shape))
+    Echo_data = Echo + noise
+
+    return A_dict, X_grid, Nt_down, Echo_data, theta_true, theta_grid
+
+
+def pulse_gen0407(Ntar, Nth, Nx, snr):
+    # 1. 生成目标角度
+    theta = np.linspace(-30, 30, Nth)  # 波束范围
+    ang_tar = np.random.randint(0, Nth, size=(Ntar, 1))  # 目标随机角度索引（Python从0开始）
+
+    # 2. 波形参数设置
+    c = 1480
+    fs = 300e3
+    f0 = 750e3  # 信号频率 750k
+    f0_ori = 750e3
+    lamda = c / f0_ori  # 波长
+    d = 0.5 * lamda
+
+    pulse_width = 4e-4
+    delay_pulse = 5e-3  # 原MATLAB中未使用，保留
+
+    Nt = 2 ** 12
+    t_0 = np.arange(Nt) / fs  # 时间轴（原MATLAB中未使用，保留）
+
+    pw_tar = int(pulse_width * fs)  # 一个脉冲时间内采样点数目
+    # 生成目标随机距离（Python索引从0开始，确保不越界）
+    range_tar = np.random.randint(0, Nt - pw_tar, size=(Ntar, 1))
+    amp_tar = np.random.rand(Ntar, 1)  # 声源随机幅值
+
+    # 3. 阵型设置
+    Lx = (Nx - 1) * d
+    elmx = np.linspace(-Lx / 2, Lx / 2, Nx)  # 阵元位置
+
+    # 对应MATLAB的ndgrid，使用indexing='ij'保证维度顺序一致
+    elmx_A, theta_A = np.meshgrid(elmx, theta, indexing='ij')
+
+    # 4. 生成原始信号X
+    X = np.zeros((Nth, Nt))
+    for ii in range(Ntar):
+        ang = ang_tar[ii, 0]
+        rng = range_tar[ii, 0]
+        # Python切片左闭右开，rng:rng+pw_tar刚好对应pw_tar个点
+        X[ang, rng: rng + pw_tar] = amp_tar[ii, 0]
+
+    # 降采样（对应MATLAB的X(:,1:4:end)，Python从0开始所以用::4）
+    X = X[:, ::4]
+    Nt = Nt // 4  # 更新Nt为降采样后的点数
+
+    # 5. 生成阵列流形矩阵A
+    # sind(theta_A)对应np.sin(np.deg2rad(theta_A))（角度转弧度）
+    A = np.exp(-1j * 2 * np.pi * f0 * elmx_A * np.sin(np.deg2rad(theta_A)) / c)
+
+    # 6. 生成回波信号Echo
+    Echo = A @ X  # 矩阵乘法，对应MATLAB的A*X
+
+    # 7. 添加噪声生成Echo_data
+    def Addnoise(x, snr):
+        """对应MATLAB的awgn(x, snr, 'measured')，添加指定SNR的高斯白噪声"""
+        Ps = np.mean(np.abs(x) ** 2)  # 计算信号功率
+        Pn = Ps / (10 ** (snr / 10))  # 计算噪声功率
+        # 生成复数噪声（实部和虚部分别为均值0、方差Pn/2的高斯分布）
+        noise = np.sqrt(Pn / 2) * (np.random.randn(*x.shape) + 1j * np.random.randn(*x.shape))
+        return x + noise
+
+    Echo_data = np.zeros((Nx, Nt), dtype=np.complex128)
+    for i in range(Nx):
+        Echo_data[i, :] = Addnoise(Echo[i, :], snr)
+
+    return A, X, Nt, Echo_data
+
+# =========================================================
+# 10. 主程序
+# =========================================================
+if __name__ == "__main__":
+    plt.close("all")
+
+    Ntar = 4
+    Nth = 128
+    Nx = 96
+    snr =-5
+
+    A, X, Nt, Echo = pulse_gen0407(Ntar, Nth, Nx, snr)
+
+    theta = np.linspace(-30, 30, Nth)
+    fs_down = 300e3 / 4
+    t = np.arange(Nt) / fs_down
+    r = t * 1480 / 2
+
+    spec_cbf = get_spectrum(Echo, A, mode="cbf")
+    spec_msbl = get_spectrum(Echo, A, mode="msbl")
+
+    result_umsbl, hist = train_umsbl_unsupervised(
+        Echo,
+        A,
+        num_layers=10,
+        epochs=60,
+        lr=4e-4,
+        lam_sparse=1e-3,
+        lam_gamma=1e-5,
+        lam_lambda_reg=1e-3,
+    )
+    spec_umsbl = np.abs(result_umsbl["x"])
+
+    plot_imagesc(theta, r, spec_cbf.T, "CBF |x|")
+    plot_imagesc(theta, r, spec_msbl.T, "Traditional MSBL |x|")
+    plot_imagesc(theta, r, spec_umsbl.T, "SBLNet-style U-MSBL |x|")
+
+    plt.figure(figsize=(7.5, 4.5))
+    plt.plot(hist, linewidth=2)
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.title("U-MSBL training loss")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    norm_X = norm(X, ord='fro') + 1e-12
+    RMSE_CBF = norm(X - spec_cbf, ord='fro') / norm_X
+    RMSE_MSBL = norm(X - spec_msbl, ord='fro') / norm_X
+    RMSE_UMSBL = norm(X - spec_umsbl, ord='fro') / norm_X
+
+    print(f"RMSE_CBF   = {RMSE_CBF:.6f}")
+    print(f"RMSE_MSBL  = {RMSE_MSBL:.6f}")
+    print(f"RMSE_UMSBL = {RMSE_UMSBL:.6f}")
+
+    out_torch = result_umsbl["out_torch"]
+    for k, st in enumerate(out_torch["states"]):
+        gamma_prev = st["gamma_prev"].detach().cpu().numpy()
+        gamma_next = st["gamma_next"].detach().cpu().numpy()
+        rel_next = norm(gamma_next - gamma_prev) / (norm(gamma_prev) + 1e-12)
+        print(f"layer {k}: rel(gnext-gprev)={rel_next:.4e}")
+
+    plt.show()
