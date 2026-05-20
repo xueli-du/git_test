@@ -1,5 +1,6 @@
-这是我的第一个 Git 文件
-我现在修改了一行import time
+这是我的第2个 Git 文件
+我现在修改了2行
+import time
 import math
 import numpy as np
 from numpy.linalg import norm
